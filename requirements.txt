@@ -1,2 +1,4 @@
 requests==2.31.0
 tqdm==4.66.1
+pycryptodome>=3.19.0
+urllib3>=2.0.0

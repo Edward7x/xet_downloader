@@ -142,3 +142,4 @@ cython_debug/
 /videos/
 /ffmpeg.exe
 /m3u8_list.json
+/.idea/
