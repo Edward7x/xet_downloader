@@ -53,18 +53,32 @@ HEADERS = {
 
 
 def clean_filename(name):
-    """生成安全的文件名"""
-    valid_chars = "-_.() %s%s" % (string.ascii_letters, string.digits)
-    cleaned = ''.join(c for c in name if c in valid_chars)
-    return cleaned.strip()[:50] or "untitled_video"
+    """
+    生成安全且支持中文的文件名
+    """
+    if not name:
+        return f"video_{int(time.time())}"
+
+    # 替换 Windows/Linux 下的非法路径字符: \ / : * ? " < > |
+    invalid_chars = r'[\\/:*?"<>|]'
+    cleaned = re.sub(invalid_chars, '_', str(name))
+
+    # 去除换行符并限制长度
+    cleaned = cleaned.replace('\n', '').replace('\r', '').strip()
+
+    # 如果清洗后为空，给个保底值
+    return cleaned[:100] if cleaned else f"video_{int(time.time())}"
 
 
 class M3U8Downloader:
     def __init__(self, url, title, output_dir):
         self.url = url
+        # 在初始化时就完成文件名清洗
         self.title = clean_filename(title)
-        self.output_dir = output_dir
-        self.temp_dir = output_dir / f"temp_{self.title}_{int(time.time())}"
+        self.output_dir = Path(output_dir)
+        # 增加随机位防止任务重名冲突
+        self.temp_dir = self.output_dir / f"temp_{self.title}_{random.getrandbits(16)}"
+
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
         self.session.verify = False
@@ -126,7 +140,7 @@ class M3U8Downloader:
                     return False
 
                 full_key_url = urljoin(self.url, key_uri)
-                logger.info(f"检测到加密，正在获取密钥: {full_key_url}")
+                logger.info(f"正在获取解密密钥: {full_key_url}")
                 self.key_content = self.get_content(full_key_url, is_binary=True)
 
                 if not self.key_content:
@@ -148,10 +162,9 @@ class M3U8Downloader:
                 for j in range(i + 1, min(i + 5, len(lines))):
                     seg_line = lines[j].strip()
                     if seg_line and not seg_line.startswith("#"):
-                        full_seg_url = urljoin(self.url, seg_line)
                         self.segments.append({
                             "index": len(self.segments),
-                            "url": full_seg_url
+                            "url": urljoin(self.url, seg_line)
                         })
                         break
 
@@ -163,12 +176,10 @@ class M3U8Downloader:
         if not self.key_content:
             return content
 
-        iv = self.key_iv
-        if not iv:
-            # 如果 M3U8 里没给 IV，标准是用序列号(big-endian binary)
-            iv = sequence_number.to_bytes(16, byteorder='big')
-
+        # 如果 M3U8 里没给 IV，标准是用序列号(big-endian binary)
+        iv = self.key_iv or sequence_number.to_bytes(16, byteorder='big')
         cryptor = AES.new(self.key_content, AES.MODE_CBC, iv)
+        
         try:
             # M3U8 的 AES-128 通常是满块对齐的，但也可能有 padding
             return cryptor.decrypt(content)
@@ -177,33 +188,25 @@ class M3U8Downloader:
             return content  # 尝试返回原始内容
 
     def download_segment(self, segment):
-        """下载单个分片任务"""
-        idx = segment['index']
-        url = segment['url']
+        """下载并尝试解密单个分片任务"""
+        idx, url = segment['index'], segment['url']
         save_path = self.temp_dir / f"{idx:05d}.ts"
-
-        if save_path.exists() and save_path.stat().st_size > 0:
-            return True
+        if save_path.exists() and save_path.stat().st_size > 0: return True
 
         for attempt in range(3):
             try:
                 content = self.get_content(url, is_binary=True)
-                if not content:
-                    raise Exception("Empty content")
-
-                # 解密
+                if not content: continue
                 if self.key_content:
                     content = self.decrypt_segment(content, idx)
 
                 # 简单校验：TS流通常以 0x47 开头
                 # 注意：如果是解密后的数据，也应该符合这个规则。
                 # 如果不校验，很容易合并进 404 HTML 导致 FFmpeg 崩溃
-                if content and len(content) > 188 and content[0] != 0x47:
+                if content and content[0] != 0x47:
                     # 尝试找一下同步字节，有时候数据头有点垃圾数据
-                    sync_offset = content.find(b'\x47')
-                    if sync_offset != -1 and sync_offset < 1000:
-                        content = content[sync_offset:]
-
+                    offset = content.find(b'\x47')
+                    if 0 < offset < 188: content = content[offset:]
                 with open(save_path, 'wb') as f:
                     f.write(content)
                 return True
@@ -216,17 +219,15 @@ class M3U8Downloader:
     def merge_segments(self, output_file):
         """使用 FFmpeg Concat 协议合并"""
         ts_files = sorted(list(self.temp_dir.glob("*.ts")))
-        if not ts_files:
-            return False
+        if not ts_files: return False
 
         # 生成 concat 列表文件 (使用绝对路径，且统一用正斜杠防止转义问题)
-        concat_file_path = self.temp_dir / "filelist.txt"
-        with open(concat_file_path, "w", encoding="utf-8") as f:
+        list_path = self.temp_dir / "filelist.txt"
+        with open(list_path, "w", encoding="utf-8") as f:
             for ts in ts_files:
                 # 关键：Windows路径在ffmpeg filelist中需要小心处理
                 # 使用 to_posix() 可以将反斜杠转换为正斜杠，这在 ffmpeg 中是通用的
-                safe_path = ts.absolute().as_posix()
-                f.write(f"file '{safe_path}'\n")
+                f.write(f"file '{ts.absolute().as_posix()}'\n")
 
         logger.info(f"开始合并 {len(ts_files)} 个分片 -> {output_file.name}")
 
@@ -235,7 +236,7 @@ class M3U8Downloader:
             "ffmpeg", "-y",
             "-f", "concat",
             "-safe", "0",
-            "-i", str(concat_file_path.absolute()),
+            "-i", str(list_path.absolute()),
             "-c", "copy",
             "-bsf:a", "aac_adtstoasc",  # 修复音频流格式，防止 MP4 没声音
             str(output_file.absolute())
@@ -254,16 +255,8 @@ class M3U8Downloader:
                 stderr=subprocess.PIPE,
                 startupinfo=startupinfo
             )
-            stdout, stderr = process.communicate(timeout=FFMPEG_TIMEOUT)
-
-            if process.returncode != 0:
-                logger.error(f"FFmpeg合并失败: {stderr.decode('utf-8', errors='ignore')}")
-                return False
-
-            # 校验输出文件
-            if output_file.exists() and output_file.stat().st_size > 1024:
-                return True
-            return False
+            process.communicate(timeout=FFMPEG_TIMEOUT)
+            return process.returncode == 0 and output_file.exists()
 
         except Exception as e:
             logger.error(f"合并过程异常: {e}")
@@ -300,21 +293,15 @@ class M3U8Downloader:
                     completed += 1
 
                 # 简单的进度条
-                percent = (i + 1) / total * 100
-                sys.stdout.write(f"\r进度: {percent:.1f}% [{completed}/{total}]")
+                sys.stdout.write(f"\r进度: {(i + 1) / total * 100:.1f}% [{completed}/{total}]")
                 sys.stdout.flush()
 
         print("")  # 换行
 
-        if completed < total * 0.95:
-            print("❌ 丢失分片过多(>5%)，放弃合并")
-            shutil.rmtree(self.temp_dir, ignore_errors=True)
-            return False
-
         # 4. 合并
-        print("🔄 正在合并...")
-        if self.merge_segments(final_mp4):
-            print(f"✅ 下载成功: {final_mp4}")
+        print("\n🔄 正在合并...")
+        if completed >= total * 0.95 and self.merge_segments(final_mp4):
+            print(f"✅ 下载完成: {final_mp4}")
             # 成功后清理临时文件
             shutil.rmtree(self.temp_dir, ignore_errors=True)
             return True
@@ -333,7 +320,7 @@ def main():
 
     # 检查 FFmpeg
     try:
-        subprocess.run(['ffmpeg', '-version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(['ffmpeg', '-version'], capture_output=True)
     except FileNotFoundError:
         print("❌ 错误: 未找到 ffmpeg，请先安装 ffmpeg 并添加到环境变量 PATH 中。")
         return
@@ -344,12 +331,13 @@ def main():
     print(f"🚀 加载了 {len(tasks)} 个任务")
 
     for task in tasks:
-        downloader = M3U8Downloader(
-            url=task.get('m3u8'),
-            title=task.get('title', '未命名视频'),
-            output_dir=OUTPUT_DIR
-        )
-        downloader.run()
+        # 修正：优先取 title 字段
+        raw_title = task.get('title') or task.get('name') or "untitled_video"
+        m3u8_url = task.get('m3u8')
+
+        if m3u8_url:
+            downloader = M3U8Downloader(m3u8_url, raw_title, OUTPUT_DIR)
+            downloader.run()
 
 
 if __name__ == "__main__":
