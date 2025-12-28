@@ -80,6 +80,18 @@ class M3U8Downloader:
         self.temp_dir = self.output_dir / f"temp_{self.title}_{random.getrandbits(16)}"
 
         self.session = requests.Session()
+
+        # --- 根据线程数调整连接池大小 ---
+        # pool_connections: 针对不同主机的连接池数量
+        # pool_maxsize: 每个连接池允许的最大连接数
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=MAX_THREADS,
+            pool_maxsize=MAX_THREADS + 2,  # 稍微多给一点余量
+            max_retries=3
+        )
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
+
         self.session.headers.update(HEADERS)
         self.session.verify = False
 
